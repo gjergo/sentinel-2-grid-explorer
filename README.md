@@ -2,9 +2,9 @@
 
 Interactive web map for exploring Sentinel-2 satellite tile grids worldwide.
 
-🌐 **[<ins>Check it out here!</ins>](https://dpird-dma.github.io/Sentinel-2-grid-explorer/)**
+🌐 **[<ins>Check it out here!</ins>](https://gjergo.github.io/sentinel-2-grid-explorer/)**
 
-[![Screenshot of Sentinel-2 Grid Explorer](images/Screenshot-1.png)](https://dpird-dma.github.io/Sentinel-2-grid-explorer/)
+[![Screenshot of Sentinel-2 Grid Explorer](images/Screenshot-1.png)](https://gjergo.github.io/sentinel-2-grid-explorer/)
 
 
 ## Features
