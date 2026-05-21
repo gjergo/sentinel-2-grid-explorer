@@ -16,6 +16,13 @@ Interactive web map for exploring Sentinel-2 satellite tile grids worldwide.
 - Share panel with copyable URLs, zoom-to-selection, and GeoJSON/CSV exports
 - Switchable OpenStreetMap and satellite basemaps with responsive UI
 
+## Features (in this fork)
+
+- Export of Sentinel-2 tile names as JSON list
+- Lasso tool selection
+- Slider for grid opacity
+- Slight optimization
+
 ## Usage
 
 Use the search box to jump to a grid (e.g. `01CCV`) or pan/zoom the map to explore tiles. Click tiles—or shift+drag a rectangle—to build a selection, then open the share panel to copy a link, download the selection, or zoom to it.

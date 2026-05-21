@@ -7,8 +7,8 @@ const CONFIG = {
     noCoverageAreaPath: 'data/sentinel-2_no_coverage.geojson', // Areas WITHOUT S2 coverage
     githubRepoUrl: 'https://github.com/DPIRD-DMA/Sentinel-2-grid-explorer',
     mapOptions: {
-        center: [0, 0], // Start centred on the globe
-        zoom: 3, // Begin zoomed out for a global overview
+        center: [42, 12], // Default view: Italy
+        zoom: 6,
         maxZoom: 17,
         minZoom: 3,
         worldCopyJump: true, // Enable world wrapping
@@ -61,7 +61,7 @@ let highlightLayer = null; // Layer for highlighting searched grids
 let highlightHaloLayer = null; // Outer halo for selection
 let highlightCoreLayer = null; // Inner core for selection
 let hoverHighlightLayer = null; // Temporary highlight for hover states
-let currentBaseLayer = 'satellite'; // Track current base layer
+let currentBaseLayer = 'openstreetmap'; // Track current base layer
 let activeHighlightMode = null; // Track current highlight render mode
 let currentHighlightSignature = null; // Track highlighted selection signature
 let shareLinkContainer = null;
@@ -74,10 +74,70 @@ let shareLinkOptionsContainer = null;
 let shareDownloadGeoJsonButton = null;
 let shareDownloadCsvButton = null;
 let shareCopyNamesButton = null;
+let shareCopyNamesJsonButton = null;
 let shareClearSelectionButton = null;
 let shareZoomSelectionButton = null;
 let selectionCountDisplay = null;
 const selectedGridMap = new Map();
+
+// Spatial index: world divided into SPATIAL_CELL_DEG° cells for fast viewport queries
+const SPATIAL_CELL_DEG = 5;
+const spatialIndex = new Map(); // "clat_clng" -> feature[]
+
+function buildSpatialIndex(features) {
+    spatialIndex.clear();
+    features.forEach(feature => {
+        const bbox = feature.__bbox;
+        if (!bbox) return;
+        const minCellLat = Math.floor(bbox.minLat / SPATIAL_CELL_DEG);
+        const maxCellLat = Math.floor(bbox.maxLat / SPATIAL_CELL_DEG);
+        const minCellLng = Math.floor(bbox.minLng / SPATIAL_CELL_DEG);
+        const maxCellLng = Math.floor(bbox.maxLng / SPATIAL_CELL_DEG);
+        for (let clat = minCellLat; clat <= maxCellLat; clat++) {
+            for (let clng = minCellLng; clng <= maxCellLng; clng++) {
+                const key = `${clat}_${clng}`;
+                let bucket = spatialIndex.get(key);
+                if (!bucket) { bucket = []; spatialIndex.set(key, bucket); }
+                bucket.push(feature);
+            }
+        }
+    });
+}
+
+function getCandidatesForBounds(bounds) {
+    if (spatialIndex.size === 0) return null; // fall back to full scan
+
+    const south = bounds.getSouth();
+    const north = bounds.getNorth();
+    let west = bounds.getWest();
+    let east = bounds.getEast();
+
+    // When the viewport spans more than 360° just return all features
+    if (east - west >= 360) return null;
+
+    const candidates = new Set();
+    const minCellLat = Math.floor(south / SPATIAL_CELL_DEG);
+    const maxCellLat = Math.floor(north / SPATIAL_CELL_DEG);
+
+    // Handle antimeridian wrap: query two longitude bands
+    const lngRanges = west <= east
+        ? [[west, east]]
+        : [[west, 180], [-180, east]];
+
+    lngRanges.forEach(([w, e]) => {
+        const minCellLng = Math.floor(w / SPATIAL_CELL_DEG);
+        const maxCellLng = Math.floor(e / SPATIAL_CELL_DEG);
+        for (let clat = minCellLat; clat <= maxCellLat; clat++) {
+            for (let clng = minCellLng; clng <= maxCellLng; clng++) {
+                const bucket = spatialIndex.get(`${clat}_${clng}`);
+                if (bucket) bucket.forEach(f => candidates.add(f));
+            }
+        }
+    });
+
+    return candidates;
+}
+
 const rectangleSelectState = {
     active: false,
     startLatLng: null,
@@ -86,9 +146,17 @@ const rectangleSelectState = {
     hasMoved: false,
     draggingWasEnabled: true
 };
+let gridOpacityScale = 1.0;
 let suppressNextGridClick = false;
 let suppressNextGridClickTimer = null;
 const activeHoverLayers = new Set();
+const lassoState = {
+    active: false,
+    drawing: false,
+    points: [],   // L.LatLng[]
+    layer: null,  // L.polygon visual
+    lastPixel: null
+};
 let pendingSelectionRetryHandle = null;
 const selectionRenderTimers = [];
 
@@ -116,8 +184,8 @@ function initMap() {
         maxZoom: 17
     });
 
-    // Set default layer to satellite
-    satelliteLayer.addTo(map);
+    // Set default layer to OSM
+    osmLayer.addTo(map);
 
     // Layer control with coverage area
     const baseLayers = {
@@ -195,6 +263,7 @@ async function loadGridData() {
         gridData = await response.json();
         if (Array.isArray(gridData?.features)) {
             prepareFeatureMetadata(gridData.features);
+            buildSpatialIndex(gridData.features);
         }
         // Initial grid display
         updateGridDisplay();
@@ -220,7 +289,7 @@ async function loadGridData() {
 function updateGridDisplay() {
     const zoom = map.getZoom();
 
-    if (zoom < CONFIG.minZoomForGrids) {
+    if (zoom < CONFIG.minZoomForGrids || gridOpacityScale === 0) {
         clearGrids();
         refreshHighlightForCurrentZoom();
         return;
@@ -253,16 +322,15 @@ function updateGridDisplay() {
 
 // Get grids within current map bounds (with world wrapping)
 function getVisibleGrids(bounds) {
-    const visibleGrids = [];
-
-    // Get the wrapped bounds to handle world repetition
     const wrappedBounds = getWrappedBounds(bounds);
 
-    gridData.features.forEach(feature => {
-        if (!feature || !feature.geometry) {
-            return;
-        }
+    // Use spatial index when available to avoid scanning all features
+    const candidates = getCandidatesForBounds(bounds);
+    const featureList = candidates ? Array.from(candidates) : gridData.features;
 
+    const visibleGrids = [];
+    featureList.forEach(feature => {
+        if (!feature || !feature.geometry) return;
         for (let i = 0; i < wrappedBounds.length; i++) {
             if (doesFeatureIntersectBounds(feature, wrappedBounds[i])) {
                 visibleGrids.push(feature);
@@ -665,58 +733,46 @@ function getGridName(feature) {
         'Grid';
 }
 
-// Generate contrasting colors for each column (01-60)
-function generateColumnColors() {
+// Pre-computed column colors — computed once, never regenerated
+const COLUMN_COLORS = (() => {
     const colors = [];
-    const totalColumns = 60;
-
-    // Use HSL color space for even distribution and high contrast
-    for (let i = 0; i < totalColumns; i++) {
-        // Space hues evenly around the color wheel with offset for better contrast
-        const hue = (i * 137.508) % 360; // Golden angle for optimal spacing
-        const saturation = 70 + (i % 3) * 10; // Vary saturation slightly
-        const lightness = 45 + (i % 2) * 15; // Alternate lightness for contrast
+    for (let i = 0; i < 60; i++) {
+        const hue = (i * 137.508) % 360;
+        const saturation = 70 + (i % 3) * 10;
+        const lightness = 45 + (i % 2) * 15;
         colors.push(`hsl(${hue}, ${saturation}%, ${lightness}%)`);
     }
-
     return colors;
-}
+})();
 
 // Get color for a grid based on its column number
 function getGridColor(gridName) {
-    if (!gridName || gridName.length < 2) return '#e74c3c'; // Default red
-
-    // Extract column number (first 2 digits)
-    const columnStr = gridName.substring(0, 2);
-    const columnNum = parseInt(columnStr, 10);
-
-    if (isNaN(columnNum) || columnNum < 1 || columnNum > 60) {
-        return '#e74c3c'; // Default red for invalid columns
-    }
-
-    const colors = generateColumnColors();
-    return colors[columnNum - 1]; // Convert to 0-based index
+    if (!gridName || gridName.length < 2) return '#e74c3c';
+    const columnNum = parseInt(gridName.substring(0, 2), 10);
+    if (isNaN(columnNum) || columnNum < 1 || columnNum > 60) return '#e74c3c';
+    return COLUMN_COLORS[columnNum - 1];
 }
 
 function getGridStrokeOpacity(zoom) {
     const minZoom = CONFIG.minZoomForGrids;
     const maxZoom = map ? map.getMaxZoom() : CONFIG.mapOptions.maxZoom;
     if (typeof zoom !== 'number' || !Number.isFinite(zoom)) {
-        return 0.8;
+        return 0.8 * gridOpacityScale;
     }
 
     if (maxZoom <= minZoom) {
-        return 0.8;
+        return 0.8 * gridOpacityScale;
     }
 
     const clampedZoom = Math.min(Math.max(zoom, minZoom), maxZoom);
     const progress = (clampedZoom - minZoom) / (maxZoom - minZoom);
-    return 0.5 + (progress * 0.5);
+    return (0.5 + progress * 0.5) * gridOpacityScale;
 }
 
 function getGridFillOpacity(zoom) {
+    if (gridOpacityScale === 0) return 0;
     const strokeOpacity = getGridStrokeOpacity(zoom);
-    return Math.max(0.05, strokeOpacity * 0.2);
+    return Math.max(0.05 * gridOpacityScale, strokeOpacity * 0.2);
 }
 
 function adjustHslLightness(hslColor, delta) {
@@ -1881,6 +1937,23 @@ async function copySelectedNamesToClipboard() {
     }
 }
 
+async function copySelectedNamesAsJsonToClipboard() {
+    const names = getSelectedNamesSorted();
+    if (names.length === 0) {
+        setShareLinkFeedback('Select grids to copy first');
+        return;
+    }
+
+    const text = JSON.stringify(names);
+
+    try {
+        await navigator.clipboard.writeText(text);
+        setShareLinkFeedback(`Copied ${names.length} name${names.length === 1 ? '' : 's'} as JSON`);
+    } catch (error) {
+        setShareLinkFeedback('Could not copy to clipboard');
+    }
+}
+
 function downloadSelectionAsGeoJSON() {
     const features = getSelectedFeatures();
     if (features.length === 0) {
@@ -1992,6 +2065,7 @@ function setupShareLinkUI() {
     shareDownloadGeoJsonButton = document.getElementById('share-download-geojson');
     shareDownloadCsvButton = document.getElementById('share-download-csv');
     shareCopyNamesButton = document.getElementById('share-copy-names');
+    shareCopyNamesJsonButton = document.getElementById('share-copy-names-json');
     shareClearSelectionButton = document.getElementById('share-clear-selection');
     shareZoomSelectionButton = document.getElementById('share-zoom-selection');
 
@@ -2041,6 +2115,12 @@ function setupShareLinkUI() {
     if (shareCopyNamesButton) {
         shareCopyNamesButton.addEventListener('click', function () {
             copySelectedNamesToClipboard();
+        });
+    }
+
+    if (shareCopyNamesJsonButton) {
+        shareCopyNamesJsonButton.addEventListener('click', function () {
+            copySelectedNamesAsJsonToClipboard();
         });
     }
 
@@ -2570,13 +2650,161 @@ function setupIntroCard() {
     }
 }
 
+// Opacity slider
+function setupOpacityControl() {
+    const slider = document.getElementById('grid-opacity-slider');
+    const valueLabel = document.getElementById('grid-opacity-value');
+    if (!slider || !valueLabel) return;
+
+    slider.addEventListener('input', function () {
+        const pct = parseInt(this.value, 10);
+        valueLabel.textContent = pct + '%';
+        const prev = gridOpacityScale;
+        gridOpacityScale = pct / 100;
+
+        if (gridOpacityScale === 0) {
+            clearPolygonLayer();
+            destroyLabelLayer();
+        } else if (prev === 0) {
+            updateGridDisplay();
+        } else if (polygonLayer) {
+            polygonLayer.eachLayer(layer => polygonLayer.resetStyle(layer));
+        }
+    });
+}
+
+// Lasso tool
+function setupLassoTool() {
+    const btn = document.getElementById('lasso-tool-btn');
+    if (!btn) return;
+
+    btn.addEventListener('click', function () {
+        if (lassoState.active) {
+            deactivateLasso();
+        } else {
+            activateLasso();
+        }
+    });
+
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && lassoState.active) {
+            deactivateLasso();
+        }
+    });
+}
+
+function activateLasso() {
+    lassoState.active = true;
+    const btn = document.getElementById('lasso-tool-btn');
+    if (btn) btn.setAttribute('aria-pressed', 'true');
+    map.getContainer().style.cursor = 'crosshair';
+    if (map.dragging) map.dragging.disable();
+}
+
+function deactivateLasso() {
+    cancelLassoDrawing();
+    lassoState.active = false;
+    const btn = document.getElementById('lasso-tool-btn');
+    if (btn) btn.setAttribute('aria-pressed', 'false');
+    map.getContainer().style.cursor = '';
+    if (map.dragging) map.dragging.enable();
+}
+
+function cancelLassoDrawing() {
+    if (lassoState.layer) {
+        map.removeLayer(lassoState.layer);
+        lassoState.layer = null;
+    }
+    lassoState.drawing = false;
+    lassoState.points = [];
+    lassoState.lastPixel = null;
+}
+
+function setupLassoMapEvents() {
+    map.on('mousedown', function (e) {
+        if (!lassoState.active) return;
+        if (e.originalEvent) e.originalEvent.preventDefault();
+
+        lassoState.drawing = true;
+        lassoState.points = [e.latlng];
+        lassoState.lastPixel = map.latLngToContainerPoint(e.latlng);
+
+        lassoState.layer = L.polygon([e.latlng], {
+            color: '#3b82f6',
+            weight: 2,
+            fillOpacity: 0.08,
+            dashArray: '5 3',
+            interactive: false
+        }).addTo(map);
+    });
+
+    map.on('mousemove', function (e) {
+        if (!lassoState.active || !lassoState.drawing) return;
+
+        const pixel = map.latLngToContainerPoint(e.latlng);
+        const last = lassoState.lastPixel;
+        if (last) {
+            const dx = pixel.x - last.x;
+            const dy = pixel.y - last.y;
+            if (dx * dx + dy * dy < 64) return; // < 8px, skip
+        }
+
+        lassoState.points.push(e.latlng);
+        lassoState.lastPixel = pixel;
+        if (lassoState.layer) lassoState.layer.setLatLngs(lassoState.points);
+    });
+
+    map.on('mouseup', function () {
+        if (!lassoState.active || !lassoState.drawing) return;
+        finalizeLasso();
+    });
+
+    document.addEventListener('mouseup', function () {
+        if (!lassoState.active || !lassoState.drawing) return;
+        finalizeLasso();
+    });
+}
+
+function finalizeLasso() {
+    const points = lassoState.points.slice();
+    cancelLassoDrawing();
+    deactivateLasso();
+
+    if (points.length < 3 || !gridData) return;
+
+    // Build ring in [lng, lat] order to match isPointInLinearRing
+    const ring = points.map(p => [p.lng, p.lat]);
+    ring.push(ring[0]); // close
+
+    const matched = [];
+    gridData.features.forEach(feature => {
+        const centroid = getFeatureCentroid(feature);
+        if (!centroid) return;
+        if (isPointInLinearRing([centroid.lng, centroid.lat], ring)) {
+            matched.push(feature);
+        }
+    });
+
+    if (matched.length === 0) return;
+
+    updateSelection(matched, {
+        replace: selectedGridMap.size === 0,
+        centerMap: false,
+        flash: true,
+        focusShareLink: false
+    });
+}
+
 // Initialise when DOM is ready
 document.addEventListener('DOMContentLoaded', function () {
     setupShareLinkUI();
     setupIntroCard();
+    setupOpacityControl();
     pendingGridSelection = getGridParamsFromUrl();
 
     initMap();
+    setupLassoTool();
+    setupLassoMapEvents();
 
     // Replace event listeners with debounced versions after initial load
     setTimeout(setupEventListeners, 1000);
